@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-java:
+    name: Build Java release files
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "11"
+          cache: maven
+
+      - name: Build Java agent
+        run: |
+          mvn -q -f java-agent/pom.xml package
+          javac --release 11 tools/AttachAgent.java
+
+      - name: Upload Java release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: java-release-files
+          path: |
+            java-agent/target/java-agent-*.jar
+            tools/AttachAgent.class
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: build-java
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x86_64
+            asset: dist/openprofiler-*-windows-x86_64.zip
+          - os: ubuntu-latest
+            target: linux-x86_64
+            asset: dist/openprofiler-*-linux-x86_64.tar.gz
+          - os: macos-15
+            target: macos-aarch64
+            asset: dist/openprofiler-*-macos-aarch64.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Download Java release files
+        uses: actions/download-artifact@v7
+        with:
+          name: java-release-files
+          path: .
+
+      - name: Build package
+        shell: pwsh
+        run: ./tools/package-release.ps1 -Target ${{ matrix.target }} -SkipJavaBuild -Archive
+
+      - name: Verify Windows zip
+        if: matrix.target == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem dist/openprofiler-*-windows-x86_64.zip | Select-Object -First 1
+          if ($null -eq $zip) {
+            throw "Windows release zip was not created."
+          }
+          $out = Join-Path $env:RUNNER_TEMP "openprofiler-windows-zip-check"
+          if (Test-Path $out) {
+            Remove-Item $out -Recurse -Force
+          }
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $out -Force
+          foreach ($path in @(
+            "oprofiler-tui.exe",
+            "java-agent-0.1.0.jar",
+            "jvmti_agent_rust.dll",
+            "attach/AttachAgent.class"
+          )) {
+            if (!(Test-Path (Join-Path $out $path))) {
+              throw "Missing expected file in Windows release zip: $path"
+            }
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.asset }}
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ matrix.asset }}
